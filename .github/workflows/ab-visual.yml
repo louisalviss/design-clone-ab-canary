@@ -2,7 +2,7 @@ name: A/B visual comparison
 
 on:
   push:
-    branches: [main]
+    branches: [main, iris-ab-integration]
   workflow_dispatch:
 
 permissions:
@@ -33,30 +33,105 @@ jobs:
         run: |
           npm ci
           npx playwright install --with-deps chromium
+      - name: Install Iris 0.4.1
+        run: |
+          curl -fsSL -o /tmp/iris.tgz https://github.com/brijr/iris/releases/download/v0.4.1/iris-x86_64-unknown-linux-musl.tar.gz
+          tar -xzf /tmp/iris.tgz -C /tmp
+          IRIS_BIN=$(find /tmp -maxdepth 3 -type f -name iris -perm -111 | head -1)
+          sudo install -m 0755 "$IRIS_BIN" /usr/local/bin/iris
+          iris --version
+          CHROME=$(find "$HOME/.cache/ms-playwright" -type f -name chrome -perm -111 | head -1)
+          test -n "$CHROME"
+          echo "IRIS_CHROME=$CHROME" >> "$GITHUB_ENV"
+          "$CHROME" --version
       - name: Serve B
         run: |
           python3 -m http.server 4173 --directory clone >/tmp/b-http.log 2>&1 &
           echo $! >/tmp/b-http.pid
-          sleep 1
-      - name: Capture A and B with same extractor/viewport
+          for i in {1..20}; do curl -fsS http://127.0.0.1:4173/ >/dev/null && exit 0; sleep 0.5; done
+          exit 1
+      - name: Control capture A and B with existing extractor
         run: |
           cd extractor
-          npm run extract:url -- --url https://launchpage.xyz/example.html --out /tmp/A --preset android-pixel6 --timeout-ms 120000
-          npm run extract:url -- --url http://127.0.0.1:4173/ --out /tmp/B --preset android-pixel6 --timeout-ms 120000
-      - name: Compare screenshots
+          /usr/bin/time -f "%e" -o /tmp/control-A.seconds npm run extract:url -- --url https://launchpage.xyz/example.html --out /tmp/A --preset android-pixel6 --timeout-ms 120000
+          /usr/bin/time -f "%e" -o /tmp/control-B.seconds npm run extract:url -- --url http://127.0.0.1:4173/ --out /tmp/B --preset android-pixel6 --timeout-ms 120000
+      - name: Treatment capture A and B with Iris
         run: |
-          python3 clone/tools/visual_diff.py /tmp/A/source.png /tmp/B/source.png --out /tmp/diff.json --diff /tmp/diff.png --max-score 1.0 | tee /tmp/compare.log
-          cat /tmp/diff.json
+          /usr/bin/time -f "%e" -o /tmp/iris-A.seconds iris --chrome "$IRIS_CHROME" --size 412x915 --scale 1 --json -o /tmp/iris-A.png https://launchpage.xyz/example.html | tee /tmp/iris-A.jsonl
+          /usr/bin/time -f "%e" -o /tmp/iris-B.seconds iris --chrome "$IRIS_CHROME" --size 412x915 --scale 1 --json -o /tmp/iris-B.png http://127.0.0.1:4173/ | tee /tmp/iris-B.jsonl
+      - name: Score control and treatment
+        run: |
+          python3 clone/tools/visual_diff.py /tmp/A/source.png /tmp/B/source.png --out /tmp/control-ab.json --diff /tmp/control-ab-diff.png --max-score 1.0
+          python3 clone/tools/visual_diff.py /tmp/iris-A.png /tmp/iris-B.png --out /tmp/iris-ab.json --diff /tmp/iris-ab-diff.png --max-score 1.0
+          python3 clone/tools/visual_diff.py /tmp/A/source.png /tmp/iris-A.png --out /tmp/A-engine-parity.json --diff /tmp/A-engine-parity.png --max-score 1.0
+          python3 clone/tools/visual_diff.py /tmp/B/source.png /tmp/iris-B.png --out /tmp/B-engine-parity.json --diff /tmp/B-engine-parity.png --max-score 1.0
+      - name: Benchmark local capture engines 10x
+        run: |
+          cat >/tmp/pw-shot.mjs <<"NODE"
+          import { chromium } from "/home/runner/work/design-clone-ab-canary/design-clone-ab-canary/extractor/node_modules/playwright/index.mjs";
+          const browser = await chromium.launch({headless:true, executablePath: process.env.IRIS_CHROME});
+          const page = await browser.newPage({viewport:{width:412,height:915}});
+          await page.goto("http://127.0.0.1:4173/", {waitUntil:"domcontentloaded"});
+          await page.screenshot({path:process.argv[2]});
+          await browser.close();
+          NODE
+          : >/tmp/playwright-times.txt
+          : >/tmp/iris-times.txt
+          for i in $(seq 1 10); do
+            /usr/bin/time -f "%e" -o /tmp/t node /tmp/pw-shot.mjs "/tmp/pw-$i.png"
+            cat /tmp/t >>/tmp/playwright-times.txt
+          done
+          for i in $(seq 1 10); do
+            /usr/bin/time -f "%e" -o /tmp/t iris --chrome "$IRIS_CHROME" --size 412x915 --scale 1 -o "/tmp/iris-$i.png" http://127.0.0.1:4173/ >/dev/null
+            cat /tmp/t >>/tmp/iris-times.txt
+          done
+      - name: Build A/B summary
+        run: |
+          python3 - <<"PY"
+          import json, statistics
+          from pathlib import Path
+          def j(p): return json.loads(Path(p).read_text())
+          def f(p): return float(Path(p).read_text().strip())
+          def ts(p):
+              x=[float(v) for v in Path(p).read_text().split()]
+              x=sorted(x)
+              return {"runs":len(x),"median_s":statistics.median(x),"p95_s":x[min(len(x)-1, int(0.95*len(x))-1)],"all_s":x}
+          c=j("/tmp/control-ab.json"); i=j("/tmp/iris-ab.json"); ap=j("/tmp/A-engine-parity.json"); bp=j("/tmp/B-engine-parity.json")
+          out={
+            "schema":"iris-ab-integration-v1",
+            "iris_version":"0.4.1",
+            "viewport":"412x915@1x",
+            "control_ab_score":c["score"],
+            "control_ab_similarity":c["similarity"],
+            "iris_ab_score":i["score"],
+            "iris_ab_similarity":i["similarity"],
+            "ab_score_delta":round(i["score"]-c["score"],6),
+            "engine_parity_A_score":ap["score"],
+            "engine_parity_B_score":bp["score"],
+            "integrated_seconds":{"control_A":f("/tmp/control-A.seconds"),"control_B":f("/tmp/control-B.seconds"),"iris_A":f("/tmp/iris-A.seconds"),"iris_B":f("/tmp/iris-B.seconds")},
+            "one_shot_benchmark":{"playwright":ts("/tmp/playwright-times.txt"),"iris":ts("/tmp/iris-times.txt")}
+          }
+          Path("/tmp/iris-ab-summary.json").write_text(json.dumps(out,indent=2)+"\n")
+          print(json.dumps(out,indent=2))
+          PY
       - name: Collect proof
         run: |
           mkdir -p /tmp/ab-proof
-          cp /tmp/A/source.png /tmp/ab-proof/A-target.png
-          cp /tmp/B/source.png /tmp/ab-proof/B-clone.png
-          cp /tmp/diff.png /tmp/ab-proof/diff.png
-          cp /tmp/diff.json /tmp/ab-proof/diff.json
-          cp /tmp/A/run.json /tmp/ab-proof/A-run.json
-          cp /tmp/B/run.json /tmp/ab-proof/B-run.json
-          cp /tmp/A/DESIGN.md /tmp/ab-proof/A-DESIGN.md
+          cp /tmp/A/source.png /tmp/ab-proof/A-target-control.png
+          cp /tmp/B/source.png /tmp/ab-proof/B-clone-control.png
+          cp /tmp/iris-A.png /tmp/ab-proof/A-target-iris.png
+          cp /tmp/iris-B.png /tmp/ab-proof/B-clone-iris.png
+          cp /tmp/control-ab-diff.png /tmp/ab-proof/control-ab-diff.png
+          cp /tmp/iris-ab-diff.png /tmp/ab-proof/iris-ab-diff.png
+          cp /tmp/A-engine-parity.png /tmp/ab-proof/A-engine-parity.png
+          cp /tmp/B-engine-parity.png /tmp/ab-proof/B-engine-parity.png
+          cp /tmp/control-ab.json /tmp/ab-proof/control-ab.json
+          cp /tmp/iris-ab.json /tmp/ab-proof/iris-ab.json
+          cp /tmp/A-engine-parity.json /tmp/ab-proof/A-engine-parity.json
+          cp /tmp/B-engine-parity.json /tmp/ab-proof/B-engine-parity.json
+          cp /tmp/iris-ab-summary.json /tmp/ab-proof/iris-ab-summary.json
+          cp /tmp/playwright-times.txt /tmp/ab-proof/playwright-times.txt
+          cp /tmp/iris-times.txt /tmp/ab-proof/iris-times.txt
       - uses: actions/upload-artifact@v4
         with:
           name: ab-visual-proof
