@@ -42,7 +42,13 @@ jobs:
           iris --version
           CHROME=$(find "$HOME/.cache/ms-playwright" -type f -name chrome -perm -111 | head -1)
           test -n "$CHROME"
-          echo "IRIS_CHROME=$CHROME" >> "$GITHUB_ENV"
+          cat > /tmp/chrome-iris <<EOF
+          #!/bin/sh
+          exec "$CHROME" --no-sandbox "\$@"
+          EOF
+          chmod 0755 /tmp/chrome-iris
+          echo "PLAYWRIGHT_CHROME=$CHROME" >> "$GITHUB_ENV"
+          echo "IRIS_CHROME=/tmp/chrome-iris" >> "$GITHUB_ENV"
           "$CHROME" --version
       - name: Serve B
         run: |
@@ -57,8 +63,11 @@ jobs:
           /usr/bin/time -f "%e" -o /tmp/control-B.seconds npm run extract:url -- --url http://127.0.0.1:4173/ --out /tmp/B --preset android-pixel6 --timeout-ms 120000
       - name: Treatment capture A and B with Iris
         run: |
+          set -o pipefail
           /usr/bin/time -f "%e" -o /tmp/iris-A.seconds iris --chrome "$IRIS_CHROME" --size 412x915 --scale 1 --json -o /tmp/iris-A.png https://launchpage.xyz/example.html | tee /tmp/iris-A.jsonl
           /usr/bin/time -f "%e" -o /tmp/iris-B.seconds iris --chrome "$IRIS_CHROME" --size 412x915 --scale 1 --json -o /tmp/iris-B.png http://127.0.0.1:4173/ | tee /tmp/iris-B.jsonl
+          test -s /tmp/iris-A.png
+          test -s /tmp/iris-B.png
       - name: Score control and treatment
         run: |
           python3 clone/tools/visual_diff.py /tmp/A/source.png /tmp/B/source.png --out /tmp/control-ab.json --diff /tmp/control-ab-diff.png --max-score 1.0
@@ -69,7 +78,7 @@ jobs:
         run: |
           cat >/tmp/pw-shot.mjs <<"NODE"
           import { chromium } from "/home/runner/work/design-clone-ab-canary/design-clone-ab-canary/extractor/node_modules/playwright/index.mjs";
-          const browser = await chromium.launch({headless:true, executablePath: process.env.IRIS_CHROME});
+          const browser = await chromium.launch({headless:true, executablePath: process.env.PLAYWRIGHT_CHROME});
           const page = await browser.newPage({viewport:{width:412,height:915}});
           await page.goto("http://127.0.0.1:4173/", {waitUntil:"domcontentloaded"});
           await page.screenshot({path:process.argv[2]});
