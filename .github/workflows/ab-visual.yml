@@ -1,0 +1,65 @@
+name: A/B visual comparison
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  compare:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout B
+        uses: actions/checkout@v4
+        with:
+          path: clone
+      - name: Checkout extractor
+        uses: actions/checkout@v4
+        with:
+          repository: louisalviss/design-md-chrome
+          ref: main
+          path: extractor
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: extractor/package-lock.json
+      - name: Install Chromium
+        working-directory: extractor
+        run: |
+          npm ci
+          npx playwright install --with-deps chromium
+      - name: Serve B
+        run: |
+          python3 -m http.server 4173 --directory clone >/tmp/b-http.log 2>&1 &
+          echo $! >/tmp/b-http.pid
+          sleep 1
+      - name: Capture A and B with same extractor/viewport
+        run: |
+          cd extractor
+          npm run extract:url -- --url https://launchpage.xyz/example.html --out /tmp/A --preset android-pixel6 --timeout-ms 120000
+          npm run extract:url -- --url http://127.0.0.1:4173/ --out /tmp/B --preset android-pixel6 --timeout-ms 120000
+      - name: Compare screenshots
+        run: |
+          python3 clone/tools/visual_diff.py /tmp/A/source.png /tmp/B/source.png --out /tmp/diff.json --diff /tmp/diff.png --max-score 1.0 | tee /tmp/compare.log
+          cat /tmp/diff.json
+      - name: Collect proof
+        run: |
+          mkdir -p /tmp/ab-proof
+          cp /tmp/A/source.png /tmp/ab-proof/A-target.png
+          cp /tmp/B/source.png /tmp/ab-proof/B-clone.png
+          cp /tmp/diff.png /tmp/ab-proof/diff.png
+          cp /tmp/diff.json /tmp/ab-proof/diff.json
+          cp /tmp/A/run.json /tmp/ab-proof/A-run.json
+          cp /tmp/B/run.json /tmp/ab-proof/B-run.json
+          cp /tmp/A/DESIGN.md /tmp/ab-proof/A-DESIGN.md
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ab-visual-proof
+          path: /tmp/ab-proof
+          if-no-files-found: error
+          retention-days: 7
