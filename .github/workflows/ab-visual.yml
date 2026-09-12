@@ -115,8 +115,37 @@ jobs:
           cp /tmp/B-engine-parity.json /tmp/ab-proof/B-engine-parity.json
           cp /tmp/iris-ab-summary.json /tmp/ab-proof/iris-ab-summary.json
       - uses: actions/upload-artifact@v4
+        if: always()
         with:
           name: ab-visual-proof
           path: /tmp/ab-proof
           if-no-files-found: error
           retention-days: 7
+      - name: Enforce visual QA gate
+        run: |
+          python3 - <<"PY"
+          import json, sys
+          from pathlib import Path
+          def score(path): return json.loads(Path(path).read_text())["score"]
+          values = {
+            "clone_control": score("/tmp/control-ab.json"),
+            "clone_iris": score("/tmp/iris-ab.json"),
+            "target_engine_parity": score("/tmp/A-engine-parity.json"),
+            "clone_engine_parity": score("/tmp/B-engine-parity.json"),
+          }
+          limits = {
+            "clone_control": 0.05,
+            "clone_iris": 0.05,
+            "target_engine_parity": 0.03,
+            "clone_engine_parity": 0.03,
+          }
+          failures = [f"{k}={values[k]:.6f}>{limits[k]:.6f}" for k in values if values[k] > limits[k]]
+          drift = abs(values["clone_control"] - values["clone_iris"])
+          if drift > 0.01:
+            failures.append(f"engine_score_drift={drift:.6f}>0.010000")
+          gate = {"schema":"iris-visual-gate-v1","values":values,"limits":limits,"engine_score_drift":drift,"pass":not failures,"failures":failures}
+          Path("/tmp/visual-gate.json").write_text(json.dumps(gate, indent=2)+"\n")
+          print(json.dumps(gate, indent=2))
+          if failures:
+            sys.exit(1)
+          PY
